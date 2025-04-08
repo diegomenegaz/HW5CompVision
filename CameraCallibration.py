@@ -28,7 +28,9 @@ try:
 
         frame = np.asanyarray(color_frame.get_data())
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
+        if frame is None:
+            print("Warning: Frame is None")
+            continue
         ret, corners = cv2.findChessboardCorners(gray, CHECKERBOARD, None)
 
         display_frame = frame.copy()
