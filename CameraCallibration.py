@@ -31,8 +31,9 @@ try:
         if frame is None:
             print("Warning: Frame is None")
             continue
+        print("Godamnit")
         ret, corners = cv2.findChessboardCorners(gray, CHECKERBOARD, None)
-
+        print("Line 35")
         display_frame = frame.copy()
         if ret:
             cv2.drawChessboardCorners(display_frame, CHECKERBOARD, corners, ret)
