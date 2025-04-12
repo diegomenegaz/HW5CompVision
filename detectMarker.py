@@ -4,131 +4,109 @@ import cv2
 import cv2.aruco
 from maestro import Controller
 import time
+import threading
 
-#MovementController For Demo Includes Head and Wheels
+# Maestro Ports
 HeadVertPORT = 4
 HeadHorPORT = 3
 MPORT = 0
 MPORT2 = 1
 FORWARD = 8000
 STOP = 6000
-"""
-class MovementControl:
-	_instance = None
-	@staticmethod
-	def getInst():
-		if MovementControl._instance == None:
-			MovementControl._instance = MovementControl()
-		return MovementControl._instance
-	def __init__(self):
-		self.m = Controller()
-		pass
-# Wheel Based Movement
 
-	def arc_L(self,duration=2):
-		self.m.setTarget(MPORT, 5500)
-		self.m.setTarget(MPORT2, 7000)
-		time.sleep(duration)
-	def arc_R(self,duration=2):
-		self.m.setTarget(MPORT2, 5500)
-		self.m.setTarget(MPORT,7000)
-		time.sleep(duration)
-	def breaks(self):
-		self.m.setTarget(MPORT, 6000)
-		self.m.setTarget(MPORT2, 6000)
-"""
-
-# Load camera matrix and distortion coefficients
+# Load camera calibration data
 camera_matrix = np.load('cameraMatrix.npy')
 dist_coeffs = np.load('distCoeffs.npy')
-#movement = MovementControl().getInst()
-# Define ArUco dictionary and parameters
-aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)  # Correct way to get dictionary
-aruco_params = cv2.aruco.DetectorParameters()  # Use DetectorParameters directly
 
-# Start RealSense pipeline
+# ArUco Setup
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+aruco_params = cv2.aruco.DetectorParameters()
+
+# RealSense Pipeline Setup
 pipeline = rs.pipeline()
 config = rs.config()
 config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 pipeline.start(config)
 
-# Create ArUco marker detection function
-def detect_aruco_markers(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, rejected_img_points = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=aruco_params)
-    if len(corners) > 0:
-        # Draw detected markers
-        frame = cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-    return frame, corners, ids
+# Shared data between threads
+shared_data = {
+    "frame": None,
+    "depth": None,
+    "corners": [],
+    "ids": [],
+    "lock": threading.Lock()
+}
 
-# Create RealSense pipeline to get depth data (for position tracking)
-def get_depth_data():
-    frames = pipeline.wait_for_frames()
-    color_frame = frames.get_color_frame()
-    depth_frame = frames.get_depth_frame()
+# Controller Setup
+motor_controller = Controller()
 
-    # Ensure both color and depth frames are available
-    if not color_frame or not depth_frame:
-        print("Error: Missing color or depth frame.")
-        return None, None
+# Thread: Capture & Detect
+def camera_thread():
+    while True:
+        frames = pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        depth_frame = frames.get_depth_frame()
 
-    color_image = np.asanyarray(color_frame.get_data())
-    depth_image = np.asanyarray(depth_frame.get_data())
-    return color_image, depth_image
+        if not color_frame or not depth_frame:
+            continue
 
-# Function to get the position of ArUco markers in 3D
-def get_marker_3d_position(corner, depth_image):
-    # Find the center of the marker
-    cX = int(np.mean(corner[0][:, 0]))
-    cY = int(np.mean(corner[0][:, 1]))
+        color_image = np.asanyarray(color_frame.get_data())
+        depth_image = np.asanyarray(depth_frame.get_data())
+        undistorted_image = cv2.undistort(color_image, camera_matrix, dist_coeffs)
 
-    # Get the depth value at the center of the marker
-    depth = depth_image[cY, cX]
+        gray = cv2.cvtColor(undistorted_image, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=aruco_params)
+        output = cv2.aruco.drawDetectedMarkers(undistorted_image.copy(), corners, ids)
 
-    # Convert depth to real-world coordinates using RealSense camera intrinsics
-    depth_scale = 0.001  # Typically in meters for RealSense
-    depth_value = depth * depth_scale
-    return (cX, cY, depth_value)
+        with shared_data["lock"]:
+            shared_data["frame"] = output
+            shared_data["depth"] = depth_image
+            shared_data["corners"] = corners
+            shared_data["ids"] = ids
 
-# Main loop
-count = 0
-while True:
-    color_image, depth_image = get_depth_data()
+        cv2.imshow("ArUco Marker Detection", output)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-    if color_image is None or depth_image is None:
-        print("Skipping frame due to missing data.")
-        continue
+# Thread: Decision Making
+def movement_thread():
+    count = 0
+    while True:
+        with shared_data["lock"]:
+            corners = shared_data["corners"]
+            ids = shared_data["ids"]
+            depth_image = shared_data["depth"]
 
-    # Undistort the image using the camera matrix and distortion coefficients
-    undistorted_image = cv2.undistort(color_image, camera_matrix, dist_coeffs)
+        if ids is not None and len(corners) > 0:
+            for i, corner in enumerate(corners):
+                cX = int(np.mean(corner[0][:, 0]))
+                cY = int(np.mean(corner[0][:, 1]))
+                depth = depth_image[cY, cX] if depth_image is not None else 0
+                marker_pos = (cX, cY, depth * 0.001)
+                print(f"Marker {ids[i][0]} position: {marker_pos}")
 
-    # Detect ArUco markers in the undistorted image
-    frame, corners, ids = detect_aruco_markers(undistorted_image)
-    # If markers are detected, calculate their position
+                if ids[i][0] % 2 == 1:
+                    print("Arcing Left")
+                    motor_controller.setTarget(MPORT, 5500)
+                    motor_controller.setTarget(MPORT2, 7000)
+                else:
+                    print("Arcing Right")
+                    motor_controller.setTarget(MPORT2, 5500)
+                    motor_controller.setTarget(MPORT, 7000)
 
-    if len(corners) > 0:
-        for i, corner in enumerate(corners):
-            # Get the 3D position of the marker
-            marker_pos = get_marker_3d_position(corner, depth_image)
-            print(f"Marker {ids[i][0]} position: {marker_pos}")
-    """
-    if int(ids) % 2 == 1: #odd go left
-        print("Arcing Left")
-        count = count + 1
-    elif int(ids) % 2 == 0: #even Go Right
-        print("arcing Left")
-        count = count + 1
-    if count ==  4 and len(corners) == 0:
-        print("BREAKS")
-        count = 0
-    """
-    # Display the image with ArUco markers
-    cv2.imshow("ArUco Marker Detection", frame)
-    key = cv2.waitKey(1)
-    if key & 0xFF == ord('q'):
-        break
+                time.sleep(2)
+                motor_controller.setTarget(MPORT, 6000)
+                motor_controller.setTarget(MPORT2, 6000)
+        time.sleep(0.1)
 
-# Clean up
+# Start threads
+cam_thread = threading.Thread(target=camera_thread, daemon=True)
+move_thread = threading.Thread(target=movement_thread, daemon=True)
+
+cam_thread.start()
+move_thread.start()
+
+cam_thread.join()
 pipeline.stop()
 cv2.destroyAllWindows()
