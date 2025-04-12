@@ -41,6 +41,52 @@ shared_data = {
 # Controller Setup
 motor_controller = Controller()
 
+
+# Add initial servo positions for head tracking
+servo_pos = {
+    "hor": 6000,
+    "vert": 6000
+}
+
+def head_tracking_thread():
+    FRAME_CENTER_X = 320  # Assuming 640x480 resolution
+    FRAME_CENTER_Y = 240
+    TOLERANCE = 20         # Pixels
+    STEP = 100             # Maestro servo step size
+
+    while True:
+        with shared_data["lock"]:
+            corners = shared_data["corners"]
+            ids = shared_data["ids"]
+
+        if ids is not None and len(corners) > 0:
+            for corner in corners:
+                cX = int(np.mean(corner[0][:, 0]))
+                cY = int(np.mean(corner[0][:, 1]))
+
+                # Adjust horizontal head servo
+                if cX < FRAME_CENTER_X - TOLERANCE:
+                    servo_pos["hor"] += STEP
+                    servo_pos["hor"] = min(8000, servo_pos["hor"])
+                    motor_controller.setTarget(HeadHorPORT, servo_pos["hor"])
+                elif cX > FRAME_CENTER_X + TOLERANCE:
+                    servo_pos["hor"] -= STEP
+                    servo_pos["hor"] = max(4000, servo_pos["hor"])
+                    motor_controller.setTarget(HeadHorPORT, servo_pos["hor"])
+
+                # Adjust vertical head servo
+                if cY < FRAME_CENTER_Y - TOLERANCE:
+                    servo_pos["vert"] += STEP
+                    servo_pos["vert"] = min(8000, servo_pos["vert"])
+                    motor_controller.setTarget(HeadVertPORT, servo_pos["vert"])
+                elif cY > FRAME_CENTER_Y + TOLERANCE:
+                    servo_pos["vert"] -= STEP
+                    servo_pos["vert"] = max(4000, servo_pos["vert"])
+                    motor_controller.setTarget(HeadVertPORT, servo_pos["vert"])
+
+        time.sleep(0.05)
+
+
 # Thread: Capture & Detect
 def camera_thread():
     while True:
@@ -103,8 +149,10 @@ def movement_thread():
 # Start threads
 cam_thread = threading.Thread(target=camera_thread, daemon=True)
 move_thread = threading.Thread(target=movement_thread, daemon=True)
+head_thread = threading.Thread(target=head_tracking_thread, daemon=True)
 
 cam_thread.start()
+head_thread.start()
 move_thread.start()
 
 cam_thread.join()
