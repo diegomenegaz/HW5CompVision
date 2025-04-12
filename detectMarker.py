@@ -2,33 +2,15 @@ import pyrealsense2 as rs
 import numpy as np
 import cv2
 import cv2.aruco
-from maestro import Controller
-import time
 import threading
 import queue
+import time
+from movement_control import MovementControl  # make sure this points to your MovementControl class
 
-# ===================== Maestro Ports =====================
-HeadVertPORT = 4
-HeadHorPORT = 3
-MPORT = 0
-MPORT2 = 1
+# Initialize shared components
+movement = MovementControl.getInst()
+motor_queue = queue.Queue()
 
-# ===================== Camera Calibration =====================
-camera_matrix = np.load('cameraMatrix.npy')
-dist_coeffs = np.load('distCoeffs.npy')
-
-# ===================== ArUco Setup =====================
-aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-aruco_params = cv2.aruco.DetectorParameters()
-
-# ===================== RealSense Setup =====================
-pipeline = rs.pipeline()
-config = rs.config()
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-pipeline.start(config)
-
-# ===================== Shared Data & Controller =====================
 shared_data = {
     "frame": None,
     "depth": None,
@@ -38,16 +20,33 @@ shared_data = {
 }
 seen_ids = set()
 
-# Maestro Controller and Motor Command Queue
-motor_controller = Controller()
-motor_queue = queue.Queue()
+# === Queued Motor Command System ===
+def queue_motor_command(command_fn, *args):
+    motor_queue.put((command_fn, args))
 
-def queue_motor_command(port, value):
-    motor_queue.put((port, value))
+def motor_dispatcher_thread():
+    while True:
+        try:
+            cmd_fn, args = motor_queue.get(timeout=1)
+            cmd_fn(*args)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"[Motor Error] {e}")
 
-# ===================== Threads =====================
-
+# === Camera Thread ===
 def camera_thread():
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    pipeline.start(config)
+
+    camera_matrix = np.load('cameraMatrix.npy')
+    dist_coeffs = np.load('distCoeffs.npy')
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    aruco_params = cv2.aruco.DetectorParameters()
+
     while True:
         frames = pipeline.wait_for_frames()
         color_frame = frames.get_color_frame()
@@ -73,10 +72,15 @@ def camera_thread():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    pipeline.stop()
+    cv2.destroyAllWindows()
+
+# === Head Tracking Thread ===
 def head_tracking_thread():
-    servo_pos = {"hor": 6000, "vert": 6000}
+    hor, vert = 6000, 6000
     FRAME_CENTER_X, FRAME_CENTER_Y = 320, 240
-    TOLERANCE, STEP = 20, 100
+    TOLERANCE = 20
+    STEP = 100
 
     while True:
         with shared_data["lock"]:
@@ -88,69 +92,51 @@ def head_tracking_thread():
             cY = int(np.mean(corners[0][0][:, 1]))
 
             if cX < FRAME_CENTER_X - TOLERANCE:
-                servo_pos["hor"] += STEP
-                servo_pos["hor"] = min(8000, servo_pos["hor"])
-                queue_motor_command(HeadHorPORT, servo_pos["hor"])
+                hor = min(8000, hor + STEP)
+                queue_motor_command(movement.pan, hor)
             elif cX > FRAME_CENTER_X + TOLERANCE:
-                servo_pos["hor"] -= STEP
-                servo_pos["hor"] = max(4000, servo_pos["hor"])
-                queue_motor_command(HeadHorPORT, servo_pos["hor"])
+                hor = max(4000, hor - STEP)
+                queue_motor_command(movement.pan, hor)
 
             if cY < FRAME_CENTER_Y - TOLERANCE:
-                servo_pos["vert"] += STEP
-                servo_pos["vert"] = min(8000, servo_pos["vert"])
-                queue_motor_command(HeadVertPORT, servo_pos["vert"])
+                vert = min(8000, vert + STEP)
+                queue_motor_command(movement.tilt, vert)
             elif cY > FRAME_CENTER_Y + TOLERANCE:
-                servo_pos["vert"] -= STEP
-                servo_pos["vert"] = max(4000, servo_pos["vert"])
-                queue_motor_command(HeadVertPORT, servo_pos["vert"])
+                vert = max(4000, vert - STEP)
+                queue_motor_command(movement.tilt, vert)
 
         time.sleep(0.05)
 
+# === Movement Thread ===
 def movement_thread():
     global seen_ids
-    while True:
+    while len(seen_ids) < 4:
         with shared_data["lock"]:
             corners = shared_data["corners"]
             ids = shared_data["ids"]
 
         if ids is not None and len(ids) > 0:
-            for i, marker_id in enumerate(ids.flatten()):
-                if marker_id not in seen_ids and len(seen_ids) < 4:
-                    print(f"New Marker {marker_id} Detected.")
+            for marker_id in ids.flatten():
+                if marker_id not in seen_ids:
                     seen_ids.add(marker_id)
+                    print(f"Detected Marker {marker_id}, deciding movement...")
 
                     if marker_id % 2 == 1:
-                        print("Arcing LEFT")
-                        queue_motor_command(MPORT, 5500)
-                        queue_motor_command(MPORT2, 7000)
+                        print("→ Arc LEFT")
+                        queue_motor_command(movement.arc_L)
                     else:
-                        print("Arcing RIGHT")
-                        queue_motor_command(MPORT, 7000)
-                        queue_motor_command(MPORT2, 5500)
+                        print("→ Arc RIGHT")
+                        queue_motor_command(movement.arc_R)
 
                     time.sleep(2.5)
+                    print("→ Stopping")
+                    queue_motor_command(movement.stop)
 
-                    # STOP
-                    queue_motor_command(MPORT, 6000)
-                    queue_motor_command(MPORT2, 6000)
-                    print("Stopping...\n")
-        if len(seen_ids) >= 4:
-            print("Completed 4 markers. Stopping movement.")
-            break
         time.sleep(0.1)
 
-def motor_dispatcher_thread():
-    while True:
-        try:
-            port, value = motor_queue.get(timeout=1)
-            motor_controller.setTarget(port, value)
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"Motor dispatch error: {e}")
+    print("Completed 4 markers. Ending movement.")
 
-# ===================== Start Threads =====================
+# === Start Threads ===
 threads = [
     threading.Thread(target=camera_thread, daemon=True),
     threading.Thread(target=head_tracking_thread, daemon=True),
@@ -161,7 +147,5 @@ threads = [
 for t in threads:
     t.start()
 
-threads[2].join()  # Wait only for movement thread to finish 4 markers
-pipeline.stop()
-cv2.destroyAllWindows()
-print("Program complete.")
+threads[2].join()  # Wait for movement thread to finish 4 markers
+print("Robot program complete.")
