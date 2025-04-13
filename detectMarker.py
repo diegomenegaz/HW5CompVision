@@ -5,7 +5,7 @@ import cv2.aruco
 import threading
 import queue
 import time
-from movement_control import MovementControl  # make sure this points to your MovementControl class
+from testMovement import MovementControl  # make sure this points to your MovementControl class
 
 # Initialize shared components
 movement = MovementControl.getInst()
